@@ -1,0 +1,215 @@
+#version 460
+#extension GL_EXT_ray_tracing : enable
+#extension GL_GOOGLE_include_directive : enable
+#extension GL_EXT_scalar_block_layout : enable
+#extension GL_EXT_buffer_reference : require
+#extension GL_EXT_nonuniform_qualifier : enable
+
+#include "../lib/uniform_bindings.glsl"
+#include "../rt/bindings.glsl"
+
+#include "../lib/payload.glsl"
+#include "../lib/rand.glsl"
+#include "../lib/brdf2.glsl"
+#include "../lib/conversions.glsl"
+#include "../lib/material.glsl"
+#include "../lib/tonemap.glsl"
+#include "../lib/colors.glsl"
+#include "../lib/utils.glsl"
+
+uint part1by1 (uint x) {
+    x = (x & 0x0000ffffu);
+    x = ((x ^ (x << 8u)) & 0x00ff00ffu);
+    x = ((x ^ (x << 4u)) & 0x0f0f0f0fu);
+    x = ((x ^ (x << 2u)) & 0x33333333u);
+    x = ((x ^ (x << 1u)) & 0x55555555u);
+    return x;
+}
+    
+uint compact1by1 (uint x) {
+    x = (x & 0x55555555u);
+    x = ((x ^ (x >> 1u)) & 0x33333333u);
+    x = ((x ^ (x >> 2u)) & 0x0f0f0f0fu);
+    x = ((x ^ (x >> 4u)) & 0x00ff00ffu);
+    x = ((x ^ (x >> 8u)) & 0x0000ffffu);
+    return x;
+}
+    
+uint pack_morton2x16(uvec2 v) {
+	return part1by1(v.x) | (part1by1(v.y) << 1);
+}
+
+uvec2 unpack_morton2x16(uint p) {
+    return uvec2(compact1by1(p), compact1by1(p >> 1));
+}
+
+uint inverse_gray32(uint n) {
+    n = n ^ (n >> 1);
+    n = n ^ (n >> 2);
+    n = n ^ (n >> 4);
+    n = n ^ (n >> 8);
+    n = n ^ (n >> 16);
+    return n;
+}
+
+// https://www.shadertoy.com/view/llGcDm
+int hilbert( ivec2 p, int level )
+{
+    int d = 0;
+    for( int k=0; k<level; k++ )
+    {
+        int n = level-k-1;
+        ivec2 r = (p>>n)&1;
+        d += ((3*r.x)^r.y) << (2*n);
+    	if (r.y == 0) { if (r.x == 1) { p = (1<<n)-1-p; } p = p.yx; }
+    }
+    return d;
+}
+
+// https://www.shadertoy.com/view/llGcDm
+ivec2 ihilbert( int i, int level )
+{
+    ivec2 p = ivec2(0,0);
+    for( int k=0; k<level; k++ )
+    {
+        ivec2 r = ivec2( i>>1, i^(i>>1) ) & 1;
+        if (r.y==0) { if(r.x==1) { p = (1<<k) - 1 - p; } p = p.yx; }
+        p += r<<k;
+        i >>= 2;
+    }
+    return p;
+}
+
+// knuth's multiplicative hash function (fixed point R1)
+uint kmhf(uint x) {
+    return 0x80000000u + 2654435789u * x;
+}
+
+uint kmhf_inv(uint x) {
+    return (x - 0x80000000u) * 827988741u;
+}
+
+// mapping each pixel to a hilbert curve index, then taking a value from the Roberts R1 quasirandom sequence for it
+uint hilbert_r1_blue_noise(uvec2 p) {
+    #if 1
+    uint x = uint(hilbert( ivec2(p), 17 )) % (1u << 17u);
+    #else
+    //p = p ^ (p >> 1);
+    uint x = pack_morton2x16( p ) % (1u << 17u);    
+    //x = x ^ (x >> 1);
+    x = inverse_gray32(x);
+    #endif
+    #if 0
+    // based on http://extremelearning.com.au/unreasonable-effectiveness-of-quasirandom-sequences/
+    const float phi = 2.0/(sqrt(5.0)+1.0);
+	return fract(0.5+phi*float(x));
+    #else
+    x = kmhf(x);
+    return x;
+    #endif
+}
+
+// mapping each pixel to a hilbert curve index, then taking a value from the Roberts R1 quasirandom sequence for it
+float hilbert_r1_blue_noisef(uvec2 p) {
+    uint x = hilbert_r1_blue_noise(p);
+    #if 0
+    return float(x >> 24) / 256.0;
+    #else
+    return float(x) / 4294967296.0;
+    #endif
+}
+
+// inverse
+uvec2 hilbert_r1_blue_noise_inv(uint x) {
+    x = kmhf_inv(x);
+    return uvec2(ihilbert(int(x), 17));
+}
+
+layout(set = 1, binding = 0, rgba32f) uniform image2D accumulation;
+layout(set = 1, binding = 1, rgba8) uniform image2D outImage;
+
+layout(location = 0) rayPayloadEXT Payload payload;
+
+void main() {
+	ivec2 pixel = ivec2(gl_LaunchIDEXT.xy);
+    bool right = pixel.x > 960;
+    ivec2 originalPixel = pixel;
+    pixel.x %= 960;
+    uvec2 resolution = uvec2(gl_LaunchSizeEXT.y);
+    uint state = initRNG(uvec2(pixel), resolution, uni.frame);
+
+	vec2 uv = vec2(pixel) / vec2(gl_LaunchSizeEXT.xy);
+    uv.y = 1.0 - uv.y;
+    vec3 viewPos = screenToView(uni.projInverse, uv, 1.0);
+
+    vec3 origin = uni.viewInverse[3].xyz;
+    vec3 direction = mat3(uni.viewInverse) * normalize(viewPos);
+
+    vec3 throughput = vec3(1.0);
+    vec3 radiance = vec3(0.0);
+    bool inside = false;
+
+    float smoothnessFactor = 1.0;
+    for (int i = 0; i < 3; i++) {
+        payload.dist = -1.0;
+        traceRayEXT(
+            tlas,
+            gl_RayFlagsNoneEXT, 
+            0xFF,               // mask
+            0,					// sbtRecordOffset
+            0,					// sbtRecordStride
+            0,					// missIndex
+            origin,
+            0.001,
+            direction,
+            256.0,
+            0					// payloadLocation
+        );
+
+        if (payload.dist < 0.0) {
+            // Sky
+            radiance += throughput * SKY_COLOR;
+            break;
+        }
+
+        Material material = payload.material;
+        vec3 normal = payload.normal;
+    
+        radiance += throughput * material.emission;
+
+        vec3 nextDir;
+        if (right && i == 0) {
+            nextDir = payload.tbn * sampleUniformHemisphere(vec2(
+                hilbert_r1_blue_noisef(uvec2(pixel + ivec2(89 * uni.frame))),
+                hilbert_r1_blue_noisef(uvec2(pixel + ivec2(100 + 89 * uni.frame)))
+            ));
+        } else {
+            nextDir = payload.tbn * sampleUniformHemisphere(state);
+        }
+        vec3 pdf = vec3(1.0 / (2.0 * PI));
+        vec3 brdf = brdfDirect(material, payload.normal, -direction, nextDir);
+
+        vec3 hitPosition = origin + direction * payload.dist;
+        throughput *= brdf / pdf;
+        origin = hitPosition + normal * 0.01;
+        direction = nextDir;
+    }
+    vec4 previous = imageLoad(accumulation, originalPixel);
+    vec4 value;
+
+    if (isNanVec(radiance)) {
+        value = previous;
+    } else if (!moved(uni.view, prev.view)) {
+        value = vec4(
+            mix(previous.rgb, radiance, 1.0 / (previous.a + 1.0)),
+            previous.a + 1.0
+        );
+        if (previous.a > 1.0) {
+            value = previous;
+        }
+    } else {
+        value = vec4(radiance, 1.0);
+    }
+    imageStore(accumulation, originalPixel, value);
+    imageStore(outImage, originalPixel, vec4(tonemap(value.rgb), 1.0));
+}

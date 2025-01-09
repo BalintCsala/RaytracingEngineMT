@@ -1,0 +1,25 @@
+#version 460
+
+layout(local_size_x = 8, local_size_y = 8) in;
+
+layout(set = 1, binding = 0) uniform sampler2D gThroughputSampler;
+layout(set = 1, binding = 1) uniform sampler2D gSkySampler;
+layout(set = 1, binding = 2) uniform sampler2D gViewDirSampler;
+
+layout(set = 1, binding = 3, rgba32f) uniform image2D directRadiance;
+
+const vec3 SKY_COLOR = pow(vec3(0.3, 0.41, 0.59), vec3(2.2));
+
+void main() {
+    ivec2 pixel = ivec2(gl_GlobalInvocationID.xy);
+    ivec2 size = textureSize(gThroughputSampler, 0);
+	vec2 uv = vec2(pixel) / vec2(size);
+
+    vec3 viewDir = texture(gViewDirSampler, uv).xyz;
+    vec3 throughput = texture(gThroughputSampler, uv).rgb;
+    float sky = texture(gSkySampler, uv).r;
+
+    vec3 radiance = imageLoad(directRadiance, pixel).rgb;
+    radiance += sky * throughput * SKY_COLOR;
+    imageStore(directRadiance, pixel, vec4(radiance, 0.0));
+}

@@ -1,0 +1,141 @@
+#version 460
+#extension GL_EXT_ray_tracing : enable
+#extension GL_GOOGLE_include_directive : enable
+#extension GL_EXT_scalar_block_layout : enable
+#extension GL_EXT_buffer_reference : require
+#extension GL_EXT_nonuniform_qualifier : enable
+
+#include "../lib/uniform_bindings.glsl"
+#include "../rt/bindings.glsl"
+
+#include "../lib/payload.glsl"
+#include "../lib/rand.glsl"
+#include "../lib/brdf2.glsl"
+#include "../lib/conversions.glsl"
+#include "../lib/material.glsl"
+#include "../lib/tonemap.glsl"
+#include "../lib/colors.glsl"
+#include "../lib/utils.glsl"
+#include "../lib/spherical_harmonics.glsl"
+
+layout(set = 1, binding = 0, rgba32f) uniform image2D gPosition;
+layout(set = 1, binding = 1, rgba32f) uniform image2D gNormal;
+layout(set = 1, binding = 2, rgba8) uniform image2D gRoughnessMetalnessSky;
+layout(set = 1, binding = 3, rgba32f) uniform image2D diffuseSH[];
+layout(set = 1, binding = 4, rgba32f) uniform image2D prevDiffuseSH[];
+
+layout(location = 0) rayPayloadEXT Payload payload;
+
+void main() {
+	ivec2 pixel = ivec2(gl_LaunchIDEXT.xy);
+
+    vec3 roughnessMetalnessSky = imageLoad(gRoughnessMetalnessSky, pixel * 4).rgb;
+
+    float sky = roughnessMetalnessSky.b;
+    float metalness = roughnessMetalnessSky.g;
+    if (metalness > 0.9 || sky > 0.5) {
+        for (int i = 0; i < SH_COEFF_COUNT; i++) {
+            imageStore(diffuseSH[i], pixel, vec4(0.0));
+        }
+        return;
+    }
+
+    uvec2 resolution = uvec2(gl_LaunchSizeEXT.y);
+    uint state = initRNG(uvec2(pixel), resolution, uni.frame);
+
+	vec2 uv = vec2(gl_LaunchIDEXT.xy) / vec2(gl_LaunchSizeEXT.xy);
+    uv.y = 1.0 - uv.y;
+
+    vec3 position = imageLoad(gPosition, pixel * 4).xyz;
+    vec3 origin = position;
+    vec3 normal = imageLoad(gNormal, pixel * 4).xyz;
+    BRDFSample samp = sampleSpecular(state, Material(vec3(1.0), 1.0, roughnessMetalnessSky.r, vec3(0.0), false), normal, -normalize(position - uni.viewInverse[3].xyz));
+    vec3 direction = samp.direction;
+    vec3 initialDirection = direction;
+
+    vec3 radiance = vec3(0.0);
+    vec3 throughput = vec3(1.0);
+
+    for (int i = 0; i < 2; i++) {
+        traceRayEXT(
+            tlas,
+            gl_RayFlagsNoneEXT, 
+            0xFF,               // mask
+            0,					// sbtRecordOffset
+            0,					// sbtRecordStride
+            0,					// missIndex
+            origin,
+            0.001,
+            direction,
+            256.0,
+            0					// payloadLocation
+        );
+
+        if (payload.dist < 0.0) {
+            // Sky
+            radiance += throughput * SKY_COLOR;
+            break;
+        }
+
+        Material material = payload.material;
+        vec3 normal = payload.normal;
+
+        radiance += throughput * material.emission;
+
+        float specularProbability = evaluateSpecularProbability(material, -direction, normal);
+        BRDFSample samp;
+        if (randFloat(state) < specularProbability) {
+            samp = sampleSpecular(state, material, normal, -direction);
+            if (!samp.valid) {
+                break;
+            }
+            throughput /= specularProbability;
+        } else {
+            samp = sampleDiffuse(state, material, normal);
+            throughput /= (1.0 - specularProbability);
+        }
+        throughput *= samp.brdf;
+        origin += direction * payload.dist + normal * 0.01;
+        direction = samp.direction;
+    }
+
+    SH sh = encodeSH(radiance, initialDirection);
+
+    vec3 prevView = (prev.view * vec4(position, 1.0)).xyz;
+    vec4 prevClip = prev.proj * vec4(prevView, 1.0);
+    if (clamp(prevClip.xyz, -prevClip.w, prevClip.w) != prevClip.xyz) {
+        for (int i = 0; i < SH_COEFF_COUNT; i++) {
+            imageStore(diffuseSH[i], pixel, vec4(sh.coeffs[i], 1.0));
+        }
+        return;
+    }
+    vec3 prevScreen = prevClip.xyz / prevClip.w * 0.5 + 0.5;
+    prevScreen.y = 1.0 - prevScreen.y;
+    vec2 prevPixel = prevScreen.xy * vec2(gl_LaunchSizeEXT.xy);
+    ivec2 bottomLeft = ivec2(floor(prevPixel));
+    vec2 frac = fract(prevPixel);
+
+    for (int i = 0; i < SH_COEFF_COUNT; i++) {
+        vec4 prevCoeff = mix(
+            mix(
+                imageLoad(diffuseSH[i], bottomLeft + ivec2(0, 0)),
+                imageLoad(diffuseSH[i], bottomLeft + ivec2(1, 0)),
+                frac.x
+            ),
+            mix(
+                imageLoad(diffuseSH[i], bottomLeft + ivec2(0, 1)),
+                imageLoad(diffuseSH[i], bottomLeft + ivec2(1, 1)),
+                frac.x
+            ),
+            frac.y
+        );
+
+        vec4 coeff;
+        if (isNanVec(prevCoeff.rgb)) {
+            coeff = vec4(sh.coeffs[i].rgb, 1.0);
+        } else {
+            coeff = vec4(mix(prevCoeff.rgb, sh.coeffs[i], 1.0 / min(float(prevCoeff.a + 1.0), 60000.0)), prevCoeff.a + 1.0);
+        }
+        imageStore(diffuseSH[i], pixel, coeff);
+    }
+}

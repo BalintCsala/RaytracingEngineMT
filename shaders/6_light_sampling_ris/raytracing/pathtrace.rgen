@@ -1,0 +1,218 @@
+#version 460
+#extension GL_EXT_ray_tracing : enable
+#extension GL_GOOGLE_include_directive : enable
+#extension GL_EXT_scalar_block_layout : enable
+#extension GL_EXT_buffer_reference : require
+#extension GL_EXT_nonuniform_qualifier : enable
+
+#include "../lib/uniform_bindings.glsl"
+#include "../rt/bindings.glsl"
+
+#include "../lib/payload.glsl"
+#include "../lib/rand.glsl"
+#include "../lib/brdf2.glsl"
+#include "../lib/conversions.glsl"
+#include "../lib/material.glsl"
+#include "../lib/tonemap.glsl"
+#include "../lib/colors.glsl"
+#include "../lib/utils.glsl"
+
+layout(set = 1, binding = 0, rgba32f) uniform image2D accumulation;
+layout(set = 1, binding = 1, rgba8) uniform image2D outImage;
+
+layout(location = 0) rayPayloadEXT Payload payload;
+
+void main() {
+	ivec2 pixel = ivec2(gl_LaunchIDEXT.xy);
+    uvec2 resolution = uvec2(gl_LaunchSizeEXT.y);
+    uint state = initRNG(uvec2(pixel), resolution, uni.frame);
+    bool right = pixel.x > 960;
+    ivec2 originalPixel = pixel;
+    pixel.x %= 960;
+
+	vec2 uv = vec2(pixel) / vec2(960, resolution.y);
+    uv.y = 1.0 - uv.y;
+    vec3 viewPos = screenToView(uni.projInverse, uv, 1.0);
+
+    vec3 origin = uni.viewInverse[3].xyz;
+    vec3 direction = mat3(uni.viewInverse) * normalize(viewPos);
+
+    vec3 throughput = vec3(1.0);
+    vec3 radiance = vec3(0.0);
+    bool inside = false;
+
+    float smoothnessFactor = 1.0;
+    for (int i = 0; i < 3; i++) {
+        payload.dist = -1.0;
+        traceRayEXT(
+            tlas,
+            gl_RayFlagsNoneEXT, 
+            0xFF,               // mask
+            0,					// sbtRecordOffset
+            0,					// sbtRecordStride
+            0,					// missIndex
+            origin,
+            0.001,
+            direction,
+            256.0,
+            0					// payloadLocation
+        );
+        Payload hitPayload = payload;
+        vec3 hitPosition = origin + direction * hitPayload.dist;
+
+        if (hitPayload.dist < 0.0) {
+            // Sky
+            radiance += throughput * SKY_COLOR;
+            break;
+        }
+
+        Material material = hitPayload.material;
+        vec3 normal = hitPayload.normal;
+    
+        if (i == 0) {
+            radiance += throughput * material.emission;
+        }
+
+        {
+            uint lightObjIndex;
+            vec3 lightDir;
+            float lightDist;
+            float pdf;
+            if (!right) {
+                // Light sampling
+                do {
+                    lightObjIndex = emissiveObjects.ids[randUint(state, 0, emissiveObjects.ids.length())];
+                } while (lightObjIndex == hitPayload.objectId);
+                ObjDesc obj = addresses.o[lightObjIndex];
+                uint triangleCount = obj.triangleCount;
+                uint triangleIndex = randUint(state, 0, triangleCount);
+                uvec3 indices = obj.indices.i[triangleIndex];
+                vec3 p1 = (obj.modelMatrix * vec4(obj.positions.p[indices.x], 1.0)).xyz;
+                vec3 p2 = (obj.modelMatrix * vec4(obj.positions.p[indices.y], 1.0)).xyz; 
+                vec3 p3 = (obj.modelMatrix * vec4(obj.positions.p[indices.z], 1.0)).xyz;
+
+                vec2 triangleBarycentric = randVec2(state);
+                vec3 lightPoint = 
+                    triangleBarycentric.x * p1 +
+                    triangleBarycentric.y * p2 +
+                    (1.0 - triangleBarycentric.x - triangleBarycentric.y) * p3;
+
+                lightDir = lightPoint - hitPosition;
+                lightDist = length(lightDir);
+                lightDir /= lightDist;
+
+                vec3 lightNormal = cross(p2 - p1, p3 - p1);
+                float triangleArea = length(lightNormal) / 2.0;
+                lightNormal = normalize(lightNormal);
+
+                pdf = lightDist * lightDist / max(dot(lightNormal, -lightDir), 0.0) / triangleArea / float(emissiveObjects.ids.length()) / float(triangleCount);
+            } else {
+                float totalWeight = 0.0;
+                float target;
+                const int SAMPLE_COUNT = 16;
+                for (int i = 0; i < SAMPLE_COUNT; i++) {
+                    uint sampleLightObjIndex;
+                    do {
+                        sampleLightObjIndex = emissiveObjects.ids[randUint(state, 0, emissiveObjects.ids.length())];
+                    } while (sampleLightObjIndex == hitPayload.objectId);
+
+                    ObjDesc obj = addresses.o[sampleLightObjIndex];
+                    uint triangleCount = obj.triangleCount;
+                    uint triangleIndex = randUint(state, 0, triangleCount);
+                    uvec3 indices = obj.indices.i[triangleIndex];
+                    vec3 p1 = (obj.modelMatrix * vec4(obj.positions.p[indices.x], 1.0)).xyz;
+                    vec3 p2 = (obj.modelMatrix * vec4(obj.positions.p[indices.y], 1.0)).xyz; 
+                    vec3 p3 = (obj.modelMatrix * vec4(obj.positions.p[indices.z], 1.0)).xyz;
+
+                    vec2 uv1 = obj.vertices.v[indices.x].uv;
+                    vec2 uv2 = obj.vertices.v[indices.y].uv;
+                    vec2 uv3 = obj.vertices.v[indices.z].uv;
+
+                    vec2 triangleBarycentric = randVec2(state);
+                    vec3 sampleLightPoint = 
+                        triangleBarycentric.x * p1 +
+                        triangleBarycentric.y * p2 +
+                        (1.0 - triangleBarycentric.x - triangleBarycentric.y) * p3;
+                    vec2 sampleUV =
+                        triangleBarycentric.x * uv1 +
+                        triangleBarycentric.y * uv2 +
+                        (1.0 - triangleBarycentric.x - triangleBarycentric.y) * uv3;
+
+                    vec3 sampleLightDir = sampleLightPoint - hitPosition;
+                    float sampleLightDist = length(sampleLightDir);
+                    sampleLightDir /= sampleLightDist;
+                    
+                    vec3 emission = texture(textureSamplers[nonuniformEXT(obj.emissiveId)], sampleUV).rgb * 100.0;
+                    vec3 brdf = brdfDirect(material, hitPayload.normal, -direction, sampleLightDir);
+                    float sampleTarget = dot(emission * brdf, vec3(1.0 / 3.0));
+
+                    vec3 lightNormal = cross(p2 - p1, p3 - p1);
+                    float triangleArea = length(lightNormal) / 2.0;
+                    lightNormal = normalize(lightNormal);
+
+                    float samplePDF = sampleLightDist * sampleLightDist / max(dot(lightNormal, -sampleLightDir), 0.0) / triangleArea;
+
+                    float weight = 
+                        float(emissiveObjects.ids.length()) * float(triangleCount) * 
+                        sampleTarget *
+                        (1.0 / samplePDF);
+                    totalWeight += weight;
+                    if (randFloat(state) < weight / totalWeight) {
+                        lightObjIndex = sampleLightObjIndex;
+                        lightDir = sampleLightDir;
+                        lightDist = sampleLightDist;
+                        target = sampleTarget;
+                    }
+                }
+                pdf = 1.0 / target * totalWeight / float(SAMPLE_COUNT);
+                pdf = 1.0 / pdf;
+            }
+
+            payload.dist = -1.0;
+            traceRayEXT(
+                tlas,
+                gl_RayFlagsNoneEXT, 
+                0xFF,               // mask
+                0,					// sbtRecordOffset
+                0,					// sbtRecordStride
+                0,					// missIndex
+                hitPosition,
+                0.001,
+                lightDir,
+                lightDist + 1.0,
+                0					// payloadLocation
+            );
+
+            if (payload.objectId == lightObjIndex) {
+                vec3 brdf = brdfDirect(material, hitPayload.normal, -direction, lightDir);
+                radiance += throughput * payload.material.emission * brdf / pdf;  
+            }
+        }
+
+        vec3 nextDir = hitPayload.tbn * sampleUniformHemisphere(state);
+        vec3 pdf = vec3(1.0 / (2.0 * PI));
+        vec3 brdf = brdfDirect(material, hitPayload.normal, -direction, nextDir);
+
+        throughput *= brdf / pdf;
+        origin = hitPosition + normal * 0.01;
+        direction = nextDir;
+    }
+    vec4 previous = imageLoad(accumulation, originalPixel);
+    vec4 value;
+
+    if (isNanVec(radiance)) {
+        value = previous;
+    } else if (!moved(uni.view, prev.view)) {
+        value = vec4(
+            mix(previous.rgb, radiance, 1.0 / (previous.a + 1.0)),
+            previous.a + 1.0
+        );
+        if (previous.a >= 1.0) {
+            value = previous;
+        }
+    } else {
+        value = vec4(radiance, 1.0);
+    }
+    imageStore(accumulation, originalPixel, value);
+    imageStore(outImage, originalPixel, vec4(tonemap(value.rgb), 1.0));
+}

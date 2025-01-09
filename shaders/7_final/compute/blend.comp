@@ -1,0 +1,63 @@
+#version 460
+
+#extension GL_EXT_nonuniform_qualifier : enable
+
+layout(local_size_x = 8, local_size_y = 8) in;
+
+#include "../lib/spherical_harmonics.glsl"
+#include "../lib/colors.glsl"
+
+layout(set = 1, binding = 0, rgba32f) uniform image2D gEmission;
+layout(set = 1, binding = 1, rgba32f) uniform image2D diffuseSH[];
+layout(set = 1, binding = 2, rgba32f) uniform image2D gNormal;
+layout(set = 1, binding = 3, rgba32f) uniform image2D outImage;
+layout(set = 1, binding = 4, rgba32f) uniform image2D gBaseColor;
+layout(set = 1, binding = 5, rgba32f) uniform image2D specular;
+layout(set = 1, binding = 6, rgba8) uniform image2D gRoughnessMetalnessSky;
+layout(set = 1, binding = 7, rgba32f) uniform image2D diffuseSH2[];
+
+void main() {
+    ivec2 pixel = ivec2(gl_GlobalInvocationID.xy);
+
+    ivec2 sampleCoord = pixel / 4;
+    vec2 lerpFac = fract(vec2(pixel) / 4.0); 
+
+    SH sh;
+    bool left = pixel.x < 960;  
+
+    for (int i = 0; i < SH_COEFF_COUNT; i++) {
+        vec3 coeff;
+            coeff = mix(
+                mix(
+                    imageLoad(diffuseSH2[i], sampleCoord).rgb,
+                    imageLoad(diffuseSH2[i], sampleCoord + ivec2(1, 0)).rgb,
+                    lerpFac.x
+                ),
+                mix(
+                    imageLoad(diffuseSH2[i], sampleCoord + ivec2(0, 1)).rgb,
+                    imageLoad(diffuseSH2[i], sampleCoord + ivec2(1, 1)).rgb,
+                    lerpFac.x
+                ),
+                lerpFac.y
+            );
+        sh.coeffs[i] = coeff;
+    }
+    vec3 normal = imageLoad(gNormal, pixel).xyz;
+    vec3 albedo = imageLoad(gBaseColor, pixel).rgb;
+    vec3 diffuse = decodeSH(sh, normal);
+    vec3 emission = imageLoad(gEmission, pixel).rgb;
+
+    vec3 roughnessMetalnessSky = imageLoad(gRoughnessMetalnessSky, pixel).rgb;
+
+    vec3 color;
+
+    if (diffuse.b > 0.5) {
+        color = SKY_COLOR; 
+    } else {
+        color = decodeSH(sh, normal) + emission;
+    }
+
+    color = pow(roughnessMetalnessSky, vec3(1.0 / 2.2));
+
+    imageStore(outImage, pixel, vec4(color, 1.0));
+}

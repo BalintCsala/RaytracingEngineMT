@@ -1,0 +1,120 @@
+#version 460
+#extension GL_EXT_ray_tracing : enable
+#extension GL_GOOGLE_include_directive : enable
+#extension GL_EXT_scalar_block_layout : enable
+#extension GL_EXT_buffer_reference : require
+#extension GL_EXT_nonuniform_qualifier : enable
+
+#include "../lib/uniform_bindings.glsl"
+#include "../rt/bindings.glsl"
+
+#include "../lib/payload.glsl"
+#include "../lib/rand.glsl"
+#include "../lib/brdf2.glsl"
+#include "../lib/conversions.glsl"
+#include "../lib/material.glsl"
+
+layout(set = 1, binding = 0, rgba32f) uniform image2D gBaseColor;
+layout(set = 1, binding = 1, rgba32f) uniform image2D gNormal;
+layout(set = 1, binding = 2, r32f)    uniform image2D gMetalness;
+layout(set = 1, binding = 3, rgba32f) uniform image2D gPosition;
+layout(set = 1, binding = 4, rgba32f) uniform image2D gThroughput;
+layout(set = 1, binding = 5, r32f)    uniform image2D gSky;
+layout(set = 1, binding = 6, rgba32f) uniform image2D gViewDir;
+layout(set = 1, binding = 7, rgba32f) uniform image2D directRadiance;
+
+layout(location = 0) rayPayloadEXT Payload payload;
+
+const float DIRECT_SMOOTHNESS_LIMIT = 0.95;
+const float MIN_SMOOTHNESS_DECREASE = 0.99;
+
+void writeGeometryBuffers(ivec2 pixel, Material material, vec3 normal, vec3 position) {
+}
+
+void main() {
+	ivec2 pixel = ivec2(gl_LaunchIDEXT.xy);
+    uvec2 resolution = uvec2(gl_LaunchSizeEXT.y);
+    uint state = initRNG(uvec2(pixel), resolution, uni.frame);
+
+	vec2 uv = vec2(gl_LaunchIDEXT.xy) / vec2(gl_LaunchSizeEXT.xy);
+    vec3 viewPos = screenToView(uni.projInverse, uv, 1.0);
+
+    vec3 origin = uni.viewInverse[3].xyz;
+    vec3 direction = mat3(uni.viewInverse) * normalize(viewPos);
+
+    vec3 throughput = vec3(1.0);
+    vec3 emission = vec3(0.0);
+    bool inside = false;
+
+    float smoothnessFactor = 1.0;
+    while (true) {
+        traceRayEXT(
+            tlas,
+            gl_RayFlagsNoneEXT, 
+            0xFF,               // mask
+            0,					// sbtRecordOffset
+            0,					// sbtRecordStride
+            0,					// missIndex
+            origin,
+            0.001,
+            direction,
+            256.0,
+            0					// payloadLocation
+        );
+
+        if (payload.dist < 0.0) {
+            imageStore(gThroughput, pixel, vec4(throughput, 0.0));
+            imageStore(gSky, pixel, vec4(1.0));
+            imageStore(gViewDir, pixel, vec4(direction, 0.0));
+            return;
+        }
+
+        if (dot(direction, payload.normal) > 0.0) {
+            payload.normal *= -1.0;
+        }
+
+        Material material = payload.material;
+        vec3 normal = payload.normal;
+        emission += material.emission;
+
+        vec3 hitPosition = origin + direction * payload.dist;
+
+        float specularChance = evaluateSpecularProbability(material, -direction, normal);
+        vec3 pdf;
+        if (randFloat(state) < specularChance) {
+            BRDFSample samp = sampleSpecular(state, material, normal, -direction);
+            pdf = samp.brdf / specularChance;
+            direction = samp.direction;
+            smoothnessFactor *= min(1.0 - material.roughness, MIN_SMOOTHNESS_DECREASE);
+            if (!samp.valid) {
+                pdf = vec3(0.0);
+            }
+        } else if (material.refractive) {
+            pdf = getMaterialAlbedo(material) / (1.0 - specularChance);
+            direction = refract(direction, normal, inside ? 1.5 : 1.0 / 1.5);
+            inside = !inside;
+            smoothnessFactor *= MIN_SMOOTHNESS_DECREASE;
+        } else {
+            BRDFSample samp = sampleDiffuse(state, material, normal);
+            pdf = samp.brdf / (1.0 - specularChance);
+            direction = samp.direction;
+            smoothnessFactor *= 0.0;
+        }
+
+        if (smoothnessFactor < DIRECT_SMOOTHNESS_LIMIT) {
+            imageStore(gBaseColor, pixel, vec4(material.baseColor, 0.0));
+            imageStore(gNormal, pixel, vec4(normal, 0.0));
+            imageStore(gMetalness, pixel, vec4(material.metalness, 0.0, 0.0, 0.0));
+            imageStore(gPosition, pixel, vec4(hitPosition, 0.0));
+            imageStore(gThroughput, pixel, vec4(throughput, 0.0));
+            imageStore(gSky, pixel, vec4(0.0));
+            imageStore(gViewDir, pixel, vec4(direction, 0.0));
+            imageStore(directRadiance, pixel, vec4(emission, 0.0));
+            return;
+        }
+        
+        throughput *= pdf;
+        origin = hitPosition + normal * 0.01;
+    }
+
+}

@@ -1,0 +1,52 @@
+#version 460
+
+#extension GL_EXT_nonuniform_qualifier : require
+
+#include "../lib/tonemap.glsl"
+#include "../lib/spherical_harmonics.glsl"
+
+layout(local_size_x = 8, local_size_y = 8) in;
+
+layout(set = 1, binding = 0) uniform sampler2D gBaseColorSampler;
+layout(set = 1, binding = 1) uniform sampler2D gNormalSampler;
+layout(set = 1, binding = 2) uniform sampler2D gMetalnessSampler;
+layout(set = 1, binding = 3) uniform sampler2D gThroughputSampler;
+layout(set = 1, binding = 4) uniform sampler2D gSkySampler;
+
+layout(set = 1, binding = 5) uniform sampler2D directRadianceSampler;
+layout(set = 1, binding = 6, rgba32f) uniform image2D indirectSH[];
+layout(set = 1, binding = 7, rgba8) uniform image2D outputImg;
+
+const vec3 SKY_COLOR = pow(vec3(0.3, 0.41, 0.59), vec3(2.2));
+
+void main() {
+    ivec2 pixel = ivec2(gl_GlobalInvocationID.xy);
+    ivec2 size = imageSize(outputImg);
+    vec2 uv = vec2(pixel) / vec2(size);
+
+
+    SH sh;
+    for (int i = 0; i < SH_COEFF_COUNT; i++) {
+        sh.coeffs[i] = imageLoad(indirectSH[i], pixel).rgb;
+    }
+    
+    vec3 baseColor = texture(gBaseColorSampler, uv).rgb;
+    vec3 normal = texture(gNormalSampler, uv).xyz;
+    float metalness = texture(gMetalnessSampler, uv).r;
+    vec3 throughput = texture(gThroughputSampler, uv).rgb;
+    float sky = texture(gSkySampler, uv).r;
+
+    vec3 albedo = baseColor * (1.0 - metalness);
+
+    vec3 indirect = decodeSH(sh, normal);
+    vec3 direct = texture(directRadianceSampler, uv).rgb;
+    if (sky > 0.5) {
+        direct = SKY_COLOR;
+        indirect = vec3(0.0);
+    }
+    vec3 color = tonemap(throughput * (direct + indirect * albedo));
+
+    ivec2 flipPixel = pixel;
+    flipPixel.y = size.y - flipPixel.y;
+    imageStore(outputImg, flipPixel, vec4(direct, 1.0));
+}

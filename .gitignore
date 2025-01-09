@@ -1,0 +1,11 @@
+/models/
+/shaders-spv/
+/cmake-build-debug/
+/.vs/
+/.vscode/
+/_deps/
+/build/
+/models-cache
+/thirdparty/
+/venv/
+/test/

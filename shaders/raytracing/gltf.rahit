@@ -1,0 +1,30 @@
+#version 460
+#extension GL_EXT_scalar_block_layout : enable
+#extension GL_EXT_ray_tracing : enable
+#extension GL_GOOGLE_include_directive : enable
+#extension GL_EXT_buffer_reference : require
+#extension GL_EXT_nonuniform_qualifier : enable
+
+#include "../rt/bindings.glsl"
+
+#include "../lib/payload.glsl"
+
+hitAttributeEXT vec2 attribs;
+
+layout(location = 0) rayPayloadInEXT Payload payload;
+
+void main() {
+    ObjDesc desc = addresses.o[gl_InstanceID];
+    if (desc.baseColorId < 0) {
+        return;
+    }
+
+    uvec3 index = desc.indices.i[gl_PrimitiveID];
+    vec3 bary = vec3(1.0 - attribs.x - attribs.y, attribs.x, attribs.y);
+    vec2 uv = getUV(desc, index, bary);
+
+    vec4 color = texture(textureSamplers[nonuniformEXT(desc.baseColorId)], uv);
+    if (color.a < 0.1) {
+        ignoreIntersectionEXT;
+    }
+}
